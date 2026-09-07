@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -295,6 +296,60 @@ func (s *ClientService) fanoutInboundClientAdds(inboundSvc *InboundService, adds
 		}})
 	}
 	return fanoutInboundApplies(applies)
+}
+
+// fanoutInboundResults runs one job per inbound with the node pushes
+// overlapping, so a bulk op costs one RPC round-trip instead of one per node.
+// limit is the caller's own cap: an op that allocates tunnel addresses passes 1,
+// because allocation reads a cross-inbound used-set before it writes.
+func fanoutInboundResults[T any](inboundIds []int, limit int, run func(i int) T) ([]T, []error) {
+	if limit < 1 {
+		limit = 1
+	}
+	out := make([]T, len(inboundIds))
+	errs := make([]error, len(inboundIds))
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := range inboundIds {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Off the request goroutine gin's Recovery no longer covers this,
+			// so an unrecovered panic here would take the whole panel down.
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = fmt.Errorf("inbound %d: panic: %v", inboundIds[i], r)
+					logger.Errorf("panic applying bulk client change to inbound %d: %v\n%s", inboundIds[i], r, debug.Stack())
+				}
+			}()
+			out[i] = run(i)
+		}()
+	}
+	wg.Wait()
+	return out, errs
+}
+
+// addFanoutLimit serializes an add that touches a tunnel inbound. WireGuard and
+// AmneziaWG pick a free peer address by reading every inbound's used-set first,
+// so two overlapping allocations hand out the same one and the second is refused.
+func addFanoutLimit(anyTunnel bool) int {
+	if anyTunnel {
+		return 1
+	}
+	return inboundFanoutConcurrency
+}
+
+// sortedInboundIds gives the fanout a stable order, so which inbound wins a
+// per-email report no longer depends on Go's map iteration order.
+func sortedInboundIds[V any](byInbound map[int]V) []int {
+	ids := make([]int, 0, len(byInbound))
+	for id := range byInbound {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // markInboundNodesDirty makes a half-applied client edit unobservable to a node
